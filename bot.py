@@ -8,6 +8,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp import web
+import asyncio
+import threading
 
 # ---------- توکن و تنظیمات ----------
 API_TOKEN = os.getenv("BOT_TOKEN", "8704302196:AAHSFYsMu11xwcwCtQ3TqcWC5fH7UC2WPto")
@@ -81,6 +84,19 @@ async def init_db():
         print("✅ دیتابیس مقداردهی اولیه شد.")
 
 # ---------- تابع بررسی ادمین ----------
+async def health_check(request):
+    return web.Response(text="OK", status=200)
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/', health_check)  # ریشه سایت هم OK برگردونه
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=8080)
+    await site.start()
+    print("✅ Healthcheck server started on port 8080")
+    
 async def is_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
@@ -567,6 +583,10 @@ async def delete_product_process(message: types.Message, state: FSMContext):
 async def main():
     print("ربات در حال راه‌اندازی...")
     await init_db()
+    
+    # راه‌اندازی وب‌سرور برای healthcheck
+    await start_health_server()
+    
     print("ربات روشن شد...")
 
     while True:
