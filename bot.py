@@ -3,6 +3,7 @@ import aiosqlite
 import os
 import uuid
 import json
+import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,7 +13,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 from datetime import datetime
-import zarinpal
 
 # ---------- توکن و تنظیمات ----------
 API_TOKEN = os.getenv("BOT_TOKEN", "8704302196:AAHSFYsMu11xwcwCtQ3TqcWC5fH7UC2WPto")
@@ -21,6 +21,9 @@ MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "7689823397"))
 # تنظیمات زرین‌پال
 ZARINPAL_MERCHANT_ID = os.getenv("ZARINPAL_MERCHANT_ID", "YOUR_MERCHANT_ID")
 ZARINPAL_CALLBACK_URL = os.getenv("ZARINPAL_CALLBACK_URL", "https://your-railway-app.railway.app/callback")
+ZARINPAL_API_URL = "https://api.zarinpal.com/pg/v4/payment/request.json"
+ZARINPAL_VERIFY_URL = "https://api.zarinpal.com/pg/v4/payment/verify.json"
+ZARINPAL_START_PAY_URL = "https://www.zarinpal.com/pg/StartPay/{authority}"
 
 proxy_url = os.getenv("PROXY_URL", None)
 if proxy_url:
@@ -48,7 +51,37 @@ class AdminStates(StatesGroup):
     waiting_for_delete_id = State()
     waiting_for_add_admin = State()
     waiting_for_remove_admin = State()
-    waiting_for_order_status = State()
+
+# ---------- توابع پرداخت زرین‌پال ----------
+async def create_payment(amount, description, email=None):
+    """ایجاد درخواست پرداخت در زرین‌پال"""
+    payload = {
+        "merchant_id": ZARINPAL_MERCHANT_ID,
+        "amount": amount,
+        "description": description,
+        "callback_url": ZARINPAL_CALLBACK_URL,
+        "metadata": {
+            "email": email or "user@example.com"
+        }
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(ZARINPAL_API_URL, json=payload) as response:
+            result = await response.json()
+            return result
+
+async def verify_payment(authority, amount):
+    """تایید پرداخت در زرین‌پال"""
+    payload = {
+        "merchant_id": ZARINPAL_MERCHANT_ID,
+        "authority": authority,
+        "amount": amount
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(ZARINPAL_VERIFY_URL, json=payload) as response:
+            result = await response.json()
+            return result
 
 # ---------- مقداردهی اولیه دیتابیس ----------
 async def init_db():
@@ -103,7 +136,6 @@ async def init_db():
                 items TEXT,
                 total_price INTEGER,
                 status TEXT DEFAULT 'pending',
-                tracking_code TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -200,13 +232,10 @@ async def payment_callback(request):
             
             amount, user_id, order_id = payment
             
-            zarinpal_client = zarinpal.ZarinPal(merchant_id=ZARINPAL_MERCHANT_ID)
-            result = zarinpal_client.verify(
-                authority=authority,
-                amount=amount
-            )
+            # تایید پرداخت در زرین‌پال
+            result = await verify_payment(authority, amount)
             
-            if result.is_paid:
+            if result.get("data") and result["data"].get("code") == 100:
                 # بروزرسانی وضعیت پرداخت
                 await db.execute(
                     "UPDATE payments SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -233,7 +262,7 @@ async def payment_callback(request):
                 
                 # ارسال پیام تایید به کاربر
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📦 پیگیری سفارش", callback_data=f"track_order_{order_id}")],
+                    [InlineKeyboardButton(text="📦 پیگیری سفارش", callback_data=f"view_order_{order_id}")],
                     [InlineKeyboardButton(text="🏠 بازگشت به منو", callback_data="back_to_menu")]
                 ])
                 
@@ -278,7 +307,7 @@ async def notify_admins(order_id, user_id, items, total_price):
         admins = await cursor.fetchall()
     
     items_list = json.loads(items)
-    items_text = "\n".join([f"• {item['name']} × {item['quantity']} = {item['price']:,} تومان" for item in items_list])
+    items_text = "\n".join([f"• {item['name']} × {item['quantity']} = {item['price'] * item['quantity']:,} تومان" for item in items_list])
     
     for admin_id in admins:
         try:
@@ -351,6 +380,11 @@ async def send_menu(target, edit=False):
         await target.edit_text("🛍 به فروشگاه خوش اومدی!", reply_markup=keyboard)
     else:
         await target.answer("🛍 به فروشگاه خوش اومدی!", reply_markup=keyboard)
+
+# ---------- هندلر start ----------
+@dp.message(Command("start"))
+async def show_menu(message: types.Message):
+    await send_menu(message)
 
 # ---------- نمایش دسته‌بندی ----------
 @dp.callback_query(lambda c: c.data == "show_categories")
@@ -455,7 +489,6 @@ async def back_to_category_from_product(callback_query: types.CallbackQuery):
         result = await cursor.fetchone()
         if result:
             cat_id = result[0]
-            # شبیه‌سازی callback cat_
             callback_query.data = f"cat_{cat_id}"
             await show_category_products(callback_query)
 
@@ -593,21 +626,28 @@ async def checkout(callback_query: types.CallbackQuery):
         await db.commit()
     
     try:
-        zarinpal_client = zarinpal.ZarinPal(merchant_id=ZARINPAL_MERCHANT_ID)
-        
-        result = zarinpal_client.request(
+        # ایجاد درخواست پرداخت
+        result = await create_payment(
             amount=total,
             description=f"خرید از فروشگاه - کاربر {user_id}",
-            callback_url=f"{ZARINPAL_CALLBACK_URL}/callback",
             email=callback_query.from_user.username or "user@example.com"
         )
         
-        if result.is_success:
-            payment_url = result.payment_url
+        if result.get("data") and result["data"].get("code") == 100:
+            authority = result["data"]["authority"]
+            payment_url = ZARINPAL_START_PAY_URL.format(authority=authority)
+            
+            # بروزرسانی payment_id با authority
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE payments SET id = ? WHERE id = ?",
+                    (authority, payment_id)
+                )
+                await db.commit()
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💳 پرداخت از طریق درگاه", url=payment_url)],
-                [InlineKeyboardButton(text="🔄 بررسی وضعیت پرداخت", callback_data=f"check_payment_{payment_id}")],
+                [InlineKeyboardButton(text="🔄 بررسی وضعیت پرداخت", callback_data=f"check_payment_{authority}")],
                 [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu")]
             ])
             
@@ -618,16 +658,68 @@ async def checkout(callback_query: types.CallbackQuery):
                 reply_markup=keyboard
             )
         else:
+            error_msg = result.get("errors", {}).get("message", "خطای ناشناخته")
             await callback_query.message.edit_text(
-                "❌ خطا در اتصال به درگاه پرداخت. لطفاً دوباره تلاش کنید."
+                f"❌ خطا در اتصال به درگاه پرداخت: {error_msg}\n"
+                f"لطفاً دوباره تلاش کنید."
             )
-            print(f"خطا در درخواست پرداخت: {result.error}")
+            print(f"خطا در درخواست پرداخت: {result}")
             
     except Exception as e:
         print(f"خطا در پرداخت: {e}")
         await callback_query.message.edit_text(
             "❌ خطا در فرآیند پرداخت. لطفاً دوباره تلاش کنید."
         )
+    
+    await callback_query.answer()
+
+# ---------- بررسی وضعیت پرداخت ----------
+@dp.callback_query(lambda c: c.data.startswith("check_payment_"))
+async def check_payment_status(callback_query: types.CallbackQuery):
+    payment_id = callback_query.data.split("_")[2]
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT status, amount, order_id FROM payments WHERE id = ?",
+            (payment_id,)
+        )
+        payment = await cursor.fetchone()
+        
+        if not payment:
+            await callback_query.answer("پرداخت یافت نشد!", show_alert=True)
+            return
+        
+        status, amount, order_id = payment
+        
+        if status == "paid":
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📦 پیگیری سفارش", callback_data=f"view_order_{order_id}")],
+                [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu")]
+            ])
+            await callback_query.message.edit_text(
+                f"✅ پرداخت شما به مبلغ {amount:,} تومان با موفقیت انجام شد!\n"
+                f"📋 شماره سفارش: {order_id[:8].upper()}",
+                reply_markup=keyboard
+            )
+        elif status == "failed":
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 تلاش مجدد", callback_data="checkout")],
+                [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu")]
+            ])
+            await callback_query.message.edit_text(
+                "❌ پرداخت شما ناموفق بود.\nلطفاً دوباره تلاش کنید.",
+                reply_markup=keyboard
+            )
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 بررسی مجدد", callback_data=f"check_payment_{payment_id}")],
+                [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu")]
+            ])
+            await callback_query.message.edit_text(
+                "⏳ پرداخت شما در حال بررسی است.\n"
+                "اگر مبلغ از حساب شما کسر شده، منتظر بمانید تا تأیید شود.",
+                reply_markup=keyboard
+            )
     
     await callback_query.answer()
 
@@ -751,56 +843,6 @@ async def view_order_detail(callback_query: types.CallbackQuery):
         await callback_query.message.edit_text(text, reply_markup=keyboard)
         await callback_query.answer()
 
-# ---------- بررسی وضعیت پرداخت ----------
-@dp.callback_query(lambda c: c.data.startswith("check_payment_"))
-async def check_payment_status(callback_query: types.CallbackQuery):
-    payment_id = callback_query.data.split("_")[2]
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT status, amount, order_id FROM payments WHERE id = ?",
-            (payment_id,)
-        )
-        payment = await cursor.fetchone()
-        
-        if not payment:
-            await callback_query.answer("پرداخت یافت نشد!", show_alert=True)
-            return
-        
-        status, amount, order_id = payment
-        
-        if status == "paid":
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📦 پیگیری سفارش", callback_data=f"view_order_{order_id}")],
-                [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu")]
-            ])
-            await callback_query.message.edit_text(
-                f"✅ پرداخت شما به مبلغ {amount:,} تومان با موفقیت انجام شد!\n"
-                f"📋 شماره سفارش: {order_id[:8].upper()}",
-                reply_markup=keyboard
-            )
-        elif status == "failed":
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 تلاش مجدد", callback_data="checkout")],
-                [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu")]
-            ])
-            await callback_query.message.edit_text(
-                "❌ پرداخت شما ناموفق بود.\nلطفاً دوباره تلاش کنید.",
-                reply_markup=keyboard
-            )
-        else:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 بررسی مجدد", callback_data=f"check_payment_{payment_id}")],
-                [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_to_menu")]
-            ])
-            await callback_query.message.edit_text(
-                "⏳ پرداخت شما در حال بررسی است.\n"
-                "اگر مبلغ از حساب شما کسر شده، منتظر بمانید تا تأیید شود.",
-                reply_markup=keyboard
-            )
-    
-    await callback_query.answer()
-
 # ---------- مدیریت سفارشات توسط ادمین ----------
 @dp.callback_query(lambda c: c.data.startswith("approve_order_"))
 async def approve_order(callback_query: types.CallbackQuery):
@@ -817,7 +859,6 @@ async def approve_order(callback_query: types.CallbackQuery):
         )
         await db.commit()
         
-        # دریافت اطلاعات کاربر
         cursor = await db.execute("SELECT user_id FROM orders WHERE id = ?", (order_id,))
         result = await cursor.fetchone()
         if result:
@@ -861,13 +902,12 @@ async def reject_order(callback_query: types.CallbackQuery):
     await callback_query.message.edit_text(f"❌ سفارش {order_id[:8].upper()} رد شد.")
 
 @dp.callback_query(lambda c: c.data.startswith("change_status_"))
-async def change_status_menu(callback_query: types.CallbackQuery, state: FSMContext):
+async def change_status_menu(callback_query: types.CallbackQuery):
     if not await is_admin(callback_query.from_user.id):
         await callback_query.answer("شما دسترسی ندارید!", show_alert=True)
         return
     
     order_id = callback_query.data.split("_")[2]
-    await state.update_data(order_id=order_id)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 در حال پردازش", callback_data=f"set_status_processing_{order_id}")],
@@ -994,7 +1034,6 @@ async def add_category_name(message: types.Message, state: FSMContext):
         "📋 لیست دسته‌ها:"
     )
     
-    # نمایش لیست دسته‌ها
     categories = await get_category_tree()
     text = ""
     for cat_id, name, level in categories:
@@ -1045,6 +1084,34 @@ async def delete_category_start(callback_query: types.CallbackQuery, state: FSMC
     await state.set_state(AdminStates.waiting_for_delete_id)
     await callback_query.message.edit_text(text)
     await callback_query.answer()
+
+@dp.message(AdminStates.waiting_for_delete_id)
+async def delete_category_process(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("شما دسترسی ندارید!")
+        await state.clear()
+        return
+    
+    try:
+        cat_id = int(message.text)
+    except ValueError:
+        await message.answer("لطفاً یک عدد معتبر وارد کنید.")
+        return
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT name FROM categories WHERE id = ?", (cat_id,))
+        category = await cursor.fetchone()
+        if not category:
+            await message.answer("دسته‌ای با این آی‌دی وجود ندارد.")
+            await state.clear()
+            return
+        
+        # حذف دسته (محصولات و زیردسته‌ها به صورت cascade حذف می‌شوند)
+        await db.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+        await db.commit()
+    
+    await state.clear()
+    await message.answer(f"✅ دسته '{category[0]}' با موفقیت حذف شد.")
 
 # ---------- افزودن محصول توسط ادمین ----------
 @dp.callback_query(lambda c: c.data == "admin_add_product")
@@ -1445,7 +1512,6 @@ async def sales_report(callback_query: types.CallbackQuery):
         return
     
     async with aiosqlite.connect(DB_PATH) as db:
-        # آمار کلی سفارشات
         cursor = await db.execute("""
             SELECT 
                 COUNT(*) as total_orders,
@@ -1460,7 +1526,6 @@ async def sales_report(callback_query: types.CallbackQuery):
         stats = await cursor.fetchone()
         total_orders, completed, pending_payment, processing, rejected, total_revenue = stats
         
-        # آخرین 5 سفارش
         cursor = await db.execute("""
             SELECT id, user_id, total_price, status, created_at
             FROM orders
